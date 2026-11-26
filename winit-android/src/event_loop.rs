@@ -5,7 +5,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use android_activity::input::{InputEvent, KeyAction, Keycode, MotionAction};
+use android_activity::input::{
+    Axis, Button, InputEvent, KeyAction, Keycode, MotionAction, MotionEvent, ToolType,
+};
 use android_activity::{
     AndroidApp, AndroidAppWaker, ConfigurationRef, InputStatus, MainEvent, Rect,
 };
@@ -16,7 +18,10 @@ use winit_core::cursor::{Cursor, CustomCursor, CustomCursorSource};
 use winit_core::error::{
     CreateWindowError, CustomCursorError, EventLoopError, NotSupportedError, RequestError,
 };
-use winit_core::event::{self, DeviceId, FingerId, Force, StartCause, SurfaceSizeWriter};
+use winit_core::event::{
+    self, ButtonSource, DeviceId, FingerId, Force, MouseButton, MouseScrollDelta, PointerKind,
+    PointerSource, ScrollSource, StartCause, SurfaceSizeWriter,
+};
 use winit_core::event_loop::pump_events::PumpStatus;
 use winit_core::event_loop::{
     ActiveEventLoop as RootActiveEventLoop, ControlFlow, DeviceEvents, EventLoopProvider,
@@ -110,6 +115,10 @@ pub struct EventLoop {
     pending_redraw: bool,
     cause: StartCause,
     primary_pointer: Option<FingerId>,
+    /// Whether a hardware mouse has entered the window.
+    mouse_inside: bool,
+    /// Mouse buttons currently held, as Android `Button` bits.
+    mouse_buttons: u32,
     ignore_volume_keys: bool,
     combining_accent: Option<char>,
 }
@@ -149,6 +158,8 @@ impl EventLoop {
         Ok(Self {
             android_app: android_app.clone(),
             primary_pointer: None,
+            mouse_inside: false,
+            mouse_buttons: 0,
             window_target: ActiveEventLoop {
                 app: android_app.clone(),
                 control_flow: Cell::new(ControlFlow::default()),
@@ -338,7 +349,12 @@ impl EventLoop {
                     MotionAction::Move | MotionAction::Cancel => {
                         Some(Box::new(motion_event.pointers()))
                     },
-                    // TODO mouse events
+                    MotionAction::HoverMove
+                    | MotionAction::ButtonPress
+                    | MotionAction::ButtonRelease
+                    | MotionAction::Scroll => Some(Box::new(std::iter::once(
+                        motion_event.pointer_at_index(motion_event.pointer_index()),
+                    ))),
                     _ => None,
                 };
 
@@ -349,6 +365,10 @@ impl EventLoop {
                         "Input event {device_id:?}, {action:?}, loc={position:?}, \
                          pointer={pointer:?}, tool_type={tool_type:?}"
                     );
+                    if tool_type == ToolType::Mouse {
+                        self.handle_mouse_event(app, motion_event, action, device_id, position);
+                        continue;
+                    }
                     let finger_id = FingerId::from_raw(pointer.pointer_id() as usize);
                     let force = Some(Force::Normalized(pointer.pressure() as f64));
 
@@ -643,6 +663,151 @@ impl EventLoop {
 
     fn exiting(&self) -> bool {
         self.window_target.exiting()
+    }
+
+    /// Emits the pointer events a hardware mouse's `MotionEvent` means.
+    fn handle_mouse_event<A: ApplicationHandler>(
+        &mut self,
+        app: &mut A,
+        motion_event: &MotionEvent<'_>,
+        action: MotionAction,
+        device_id: Option<DeviceId>,
+        position: PhysicalPosition<f64>,
+    ) {
+        fn mouse_button(bit: u32) -> Option<MouseButton> {
+            match bit {
+                b if b == u32::from(Button::Primary) => Some(MouseButton::Left),
+                b if b == u32::from(Button::Secondary) => Some(MouseButton::Right),
+                b if b == u32::from(Button::Tertiary) => Some(MouseButton::Middle),
+                b if b == u32::from(Button::Back) => Some(MouseButton::Back),
+                b if b == u32::from(Button::Forward) => Some(MouseButton::Forward),
+                _ => None,
+            }
+        }
+        let mut dispatch = |event: event::WindowEvent| {
+            app.window_event(&self.window_target, GLOBAL_WINDOW, event);
+        };
+        if action == MotionAction::HoverMove || action == MotionAction::Move {
+            dispatch(event::WindowEvent::PointerMoved {
+                device_id,
+                primary: true,
+                position,
+                source: PointerSource::Mouse,
+            });
+            return;
+        }
+        if !self.mouse_inside {
+            self.mouse_inside = true;
+            dispatch(event::WindowEvent::PointerEntered {
+                device_id,
+                primary: true,
+                position,
+                kind: PointerKind::Mouse,
+            });
+        }
+        match action {
+            MotionAction::Down | MotionAction::PointerDown | MotionAction::ButtonPress => {
+                dispatch(event::WindowEvent::PointerMoved {
+                    device_id,
+                    primary: true,
+                    position,
+                    source: PointerSource::Mouse,
+                });
+                let pressed = if action == MotionAction::ButtonPress {
+                    u32::from(motion_event.action_button())
+                } else {
+                    let state = motion_event.button_state();
+                    let mut bits = 0;
+                    if state.primary() {
+                        bits |= u32::from(Button::Primary);
+                    }
+                    if state.secondary() {
+                        bits |= u32::from(Button::Secondary);
+                    }
+                    if state.teriary() {
+                        bits |= u32::from(Button::Tertiary);
+                    }
+                    bits
+                };
+                for bit in [
+                    u32::from(Button::Primary),
+                    u32::from(Button::Secondary),
+                    u32::from(Button::Tertiary),
+                    u32::from(Button::Back),
+                    u32::from(Button::Forward),
+                ] {
+                    if pressed & bit != 0 && self.mouse_buttons & bit == 0 {
+                        if let Some(button) = mouse_button(bit) {
+                            dispatch(event::WindowEvent::PointerButton {
+                                device_id,
+                                primary: true,
+                                state: event::ElementState::Pressed,
+                                position,
+                                button: ButtonSource::Mouse(button),
+                                is_macos_activation_click: false,
+                            });
+                            self.mouse_buttons |= bit;
+                        }
+                    }
+                }
+            },
+            MotionAction::Up | MotionAction::PointerUp | MotionAction::ButtonRelease => {
+                dispatch(event::WindowEvent::PointerMoved {
+                    device_id,
+                    primary: true,
+                    position,
+                    source: PointerSource::Mouse,
+                });
+                let released = if action == MotionAction::ButtonRelease {
+                    u32::from(motion_event.action_button())
+                } else {
+                    self.mouse_buttons
+                };
+                for bit in [
+                    u32::from(Button::Primary),
+                    u32::from(Button::Secondary),
+                    u32::from(Button::Tertiary),
+                    u32::from(Button::Back),
+                    u32::from(Button::Forward),
+                ] {
+                    if released & bit != 0 && self.mouse_buttons & bit != 0 {
+                        if let Some(button) = mouse_button(bit) {
+                            dispatch(event::WindowEvent::PointerButton {
+                                device_id,
+                                primary: true,
+                                state: event::ElementState::Released,
+                                position,
+                                button: ButtonSource::Mouse(button),
+                                is_macos_activation_click: false,
+                            });
+                            self.mouse_buttons &= !bit;
+                        }
+                    }
+                }
+            },
+            MotionAction::Cancel => {
+                self.mouse_inside = false;
+                dispatch(event::WindowEvent::PointerLeft {
+                    device_id,
+                    primary: true,
+                    position: Some(position),
+                    kind: PointerKind::Mouse,
+                });
+            },
+            MotionAction::Scroll => {
+                let pointer = motion_event.pointer_at_index(motion_event.pointer_index());
+                dispatch(event::WindowEvent::MouseWheel {
+                    device_id,
+                    delta: MouseScrollDelta::LineDelta(
+                        pointer.axis_value(Axis::Hscroll),
+                        pointer.axis_value(Axis::Vscroll),
+                    ),
+                    phase: event::TouchPhase::Moved,
+                    source: ScrollSource::Unknown,
+                });
+            },
+            _ => {},
+        }
     }
 }
 
